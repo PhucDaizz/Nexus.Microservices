@@ -1,10 +1,10 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using SharedLibrary.Configuration;
-using SharedLibrary.Interfaces;
-using SharedLibrary.Services;
+using Nexus.BuildingBlocks.Configuration;
+using Nexus.BuildingBlocks.Interfaces;
+using Nexus.BuildingBlocks.Services;
 
-namespace SharedLibrary.Extensions
+namespace Nexus.BuildingBlocks.Extensions
 {
     public static class ServiceCollectionExtensions
     {

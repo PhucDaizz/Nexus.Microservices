@@ -1,4 +1,4 @@
-﻿namespace SharedLibrary.Model
+﻿namespace Nexus.BuildingBlocks.Model
 {
     public class ApiResponse<T>
     {

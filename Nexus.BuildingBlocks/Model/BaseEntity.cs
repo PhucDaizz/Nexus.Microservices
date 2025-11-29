@@ -1,5 +1,5 @@
 ﻿using System;
-namespace SharedLibrary.Model
+namespace Nexus.BuildingBlocks.Model
 {
     public abstract class BaseEntity
     {

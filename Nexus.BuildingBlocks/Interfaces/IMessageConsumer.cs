@@ -1,5 +1,5 @@
 ﻿using System;
-namespace SharedLibrary.Interfaces
+namespace Nexus.BuildingBlocks.Interfaces
 {
     public interface IMessageConsumer
     {

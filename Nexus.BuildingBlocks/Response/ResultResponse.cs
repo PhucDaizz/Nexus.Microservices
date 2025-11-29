@@ -1,4 +1,4 @@
-﻿namespace SharedLibrary.Response
+﻿namespace Nexus.BuildingBlocks.Response
 {
     public class Result
     {

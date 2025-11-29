@@ -4,12 +4,12 @@ using Polly;
 using Polly.Retry;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using SharedLibrary.Configuration;
-using SharedLibrary.Interfaces;
+using Nexus.BuildingBlocks.Configuration;
+using Nexus.BuildingBlocks.Interfaces;
 using System.Text;
 using System.Text.Json;
 
-namespace SharedLibrary.Services
+namespace Nexus.BuildingBlocks.Services
 {
     public class RabbitMQConsumer : IMessageConsumer, IAsyncDisposable
     {

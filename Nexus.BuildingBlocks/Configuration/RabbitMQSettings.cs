@@ -1,4 +1,4 @@
-﻿namespace SharedLibrary.Configuration
+﻿namespace Nexus.BuildingBlocks.Configuration
 {
     public class RabbitMQSettings
     {
