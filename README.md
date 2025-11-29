@@ -1,5 +1,8 @@
 # Nexus.Microservices 🏗️
 
+[![NuGet](https://img.shields.io/nuget/v/Nexus.BuildingBlocks.svg?style=flat-square)](https://www.nuget.org/packages/Nexus.BuildingBlocks/)
+[![Downloads](https://img.shields.io/nuget/dt/Nexus.BuildingBlocks.svg?style=flat-square)](https://www.nuget.org/packages/Nexus.BuildingBlocks/)
+
 Nexus.Microservices được thiết kế tối ưu cho hệ thống Microservices. Thư viện cung cấp các thành phần cấu hình sẵn (pre-configured) giúp tích hợp RabbitMQ mạnh mẽ (tự động kết nối lại, chịu lỗi tốt) và chuẩn hóa API Response, giúp team tập trung vào logic nghiệp vụ thay vì tốn thời gian xử lý hạ tầng.
 
 ## 🚀 Tính năng nổi bật
