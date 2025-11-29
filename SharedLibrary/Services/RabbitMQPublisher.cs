@@ -1,8 +1,11 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Polly;
+using Polly.Retry;
 using RabbitMQ.Client;
 using SharedLibrary.Configuration;
 using SharedLibrary.Interfaces;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 
@@ -15,95 +18,154 @@ namespace SharedLibrary.Services
         private IConnection? _connection;
         private IChannel? _channel;
 
+        private readonly SemaphoreSlim _connectionLock = new SemaphoreSlim(1, 1);
+        private readonly ConcurrentDictionary<string, bool> _declaredExchanges = new();
+        private readonly ConcurrentDictionary<string, bool> _declaredQueues = new();
+
+        private readonly AsyncRetryPolicy _retryPolicy;
+
         public RabbitMQPublisher(IOptions<RabbitMQSettings> settings, ILogger<RabbitMQPublisher> logger)
         {
             _settings = settings.Value;
             _logger = logger;
+
+            _retryPolicy = Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (exception, timeSpan, retryCount, context) =>
+                    {
+                        _logger.LogWarning($"Publisher cannot connect (Attempt {retryCount}). Retrying in {timeSpan.TotalSeconds}s...");
+                    });
         }
 
-        public static async Task<RabbitMQPublisher> CreateAsync(IOptions<RabbitMQSettings> options, ILogger<RabbitMQPublisher> logger)
+        private async Task EnsureConnectionAsync()
         {
-            var publisher = new RabbitMQPublisher(options, logger);
+            if (_connection != null && _connection.IsOpen && _channel != null && _channel.IsOpen) return;
 
-            var factory = new ConnectionFactory
+            await _connectionLock.WaitAsync();
+
+            try
             {
-                HostName = publisher._settings.HostName,
-                Port = publisher._settings.Port,
-                UserName = publisher._settings.UserName,
-                Password = publisher._settings.Password,
-                VirtualHost = publisher._settings.VirtualHost,
-                AutomaticRecoveryEnabled = true,
-                NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
-            };
+                if (_connection != null && _connection.IsOpen && _channel != null && _channel.IsOpen) return;
 
-            publisher._connection = await factory.CreateConnectionAsync();
-            publisher._channel = await publisher._connection.CreateChannelAsync();
+                await _retryPolicy.ExecuteAsync(async () =>
+                {
+                    _logger.LogInformation("Connecting RabbitMQ Publisher...");
+                    var factory = new ConnectionFactory
+                    {
+                        HostName = _settings.HostName,
+                        Port = _settings.Port,
+                        UserName = _settings.UserName,
+                        Password = _settings.Password,
+                        VirtualHost = _settings.VirtualHost,
+                        AutomaticRecoveryEnabled = true
+                    };
 
-            return publisher;
+                    _connection = await factory.CreateConnectionAsync();
+                    _channel = await _connection.CreateChannelAsync();
+                    _declaredExchanges.Clear();
+                    _declaredQueues.Clear();
+
+                    _logger.LogInformation("RabbitMQ Publisher connected.");
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to connect RabbitMQ Publisher.");
+                throw; 
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
         }
 
         public async Task PublishAsync<T>(string exchange, string exchangeType, string routingKey, T message)
         {
-            if (_channel == null) throw new InvalidOperationException("Channel not initialized.");
+            await EnsureConnectionAsync();
 
-            await _channel.ExchangeDeclareAsync(exchange, ExchangeType.Topic, durable: true);
-
-            var json = JsonSerializer.Serialize(message);
-            var body = Encoding.UTF8.GetBytes(json);
-
-            var properties = new BasicProperties
+            try
             {
-                Persistent = true,
-                ContentType = "application/json"
-            };
+                if (!_declaredExchanges.ContainsKey(exchange))
+                {
+                    await _channel!.ExchangeDeclareAsync(exchange, exchangeType, durable: true);
+                    _declaredExchanges.TryAdd(exchange, true);
+                }
 
-            await _channel.BasicPublishAsync(
-                exchange: exchange,
-                routingKey: routingKey,
-                mandatory: false,
-                basicProperties: properties,
-                body: body
-            );
+                var json = JsonSerializer.Serialize(message);
+                var body = Encoding.UTF8.GetBytes(json);
 
-            _logger.LogInformation("Published message to exchange {Exchange} with routing key {RoutingKey}", exchange, routingKey);
+                var properties = new BasicProperties
+                {
+                    Persistent = true,
+                    ContentType = "application/json",
+                    MessageId = Guid.NewGuid().ToString(),
+                    Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                };
+
+                await _channel!.BasicPublishAsync(
+                    exchange: exchange,
+                    routingKey: routingKey,
+                    mandatory: false,
+                    basicProperties: properties,
+                    body: body
+                );
+
+                _logger.LogDebug("Sent -> Ex:{Ex} RK:{RK}", exchange, routingKey);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error publishing message to Exchange: {Exchange}", exchange);
+                throw;
+            }
         }
 
         public async Task PublishAsync<T>(string queueName, T message)
         {
-            if (_channel == null) throw new InvalidOperationException("Channel not initialized.");
+            await EnsureConnectionAsync();
 
-            await _channel.QueueDeclareAsync(
-                queue: queueName,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: null
-            );
-
-            var json = JsonSerializer.Serialize(message);
-            var body = Encoding.UTF8.GetBytes(json);
-
-            var properties = new BasicProperties
+            try
             {
-                Persistent = true,
-                ContentType = "application/json"
-            };
+                if (!_declaredQueues.ContainsKey(queueName))
+                {
+                    await _channel!.QueueDeclareAsync(queue: queueName, durable: true, exclusive: false, autoDelete: false);
+                    _declaredQueues.TryAdd(queueName, true);
+                }
 
-            await _channel.BasicPublishAsync(
-                exchange: string.Empty,
-                routingKey: queueName,
-                mandatory: false,
-                basicProperties: properties,
-                body: body
-            );
+                var json = JsonSerializer.Serialize(message);
+                var body = Encoding.UTF8.GetBytes(json);
 
-            _logger.LogInformation("Published message to queue {Queue}", queueName);
+                var properties = new BasicProperties
+                {
+                    Persistent = true,
+                    ContentType = "application/json",
+                    MessageId = Guid.NewGuid().ToString()
+                };
+
+                await _channel!.BasicPublishAsync(
+                    exchange: string.Empty,
+                    routingKey: queueName,
+                    mandatory: false,
+                    basicProperties: properties,
+                    body: body
+                );
+
+                _logger.LogDebug("Sent -> Queue:{Queue}", queueName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error publishing message to Queue: {Queue}", queueName);
+                throw;
+            }
         }
 
         public async ValueTask DisposeAsync()
         {
             if (_channel != null) await _channel.CloseAsync();
             if (_connection != null) await _connection.CloseAsync();
+            _connectionLock.Dispose();
         }
     }
 }

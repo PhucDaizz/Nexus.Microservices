@@ -1,7 +1,5 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using SharedLibrary.Configuration;
 using SharedLibrary.Interfaces;
 using SharedLibrary.Services;
@@ -16,19 +14,11 @@ namespace SharedLibrary.Extensions
         {
             services.Configure<RabbitMQSettings>(configuration.GetSection(RabbitMQSettings.SectionName));
 
-            services.AddSingleton<IMessagePublisher>(serviceProvider =>
-            {
-                var options = serviceProvider.GetRequiredService<IOptions<RabbitMQSettings>>();
-                var logger = serviceProvider.GetRequiredService<ILogger<RabbitMQPublisher>>();
-                return RabbitMQPublisher.CreateAsync(options, logger).GetAwaiter().GetResult();
-            });
+            services.AddSingleton<RabbitMQConsumer>();
+            services.AddSingleton<IMessageConsumer>(sp => sp.GetRequiredService<RabbitMQConsumer>());
 
-            services.AddSingleton<IMessageConsumer>(serviceProvider =>
-            {
-                var options = serviceProvider.GetRequiredService<IOptions<RabbitMQSettings>>();
-                var logger = serviceProvider.GetRequiredService<ILogger<RabbitMQConsumer>>(); 
-                return RabbitMQConsumer.CreateAsync(options, logger).GetAwaiter().GetResult();
-            });
+            services.AddSingleton<RabbitMQPublisher>();
+            services.AddSingleton<IMessagePublisher>(sp => sp.GetRequiredService<RabbitMQPublisher>());
 
             return services;
         }
