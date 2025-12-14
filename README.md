@@ -42,7 +42,9 @@ Thêm section RabbitMQ vào file `appsettings.json` của dự án:
     "Port": 5672,
     "UserName": "guest",
     "Password": "guest",
-    "VirtualHost": "/"
+    "VirtualHost": "/",
+    "RetryCount": 3,
+    "RetryDelaySeconds": 5
   }
 }
 ```
@@ -58,8 +60,29 @@ using Nexus.BuildingBlocks.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Đăng ký RabbitMQ (Consumer & Publisher) 
+// Cách 1: Đăng ký với cấu hình mặc định (hỗ trợ đầy đủ Unicode)
 builder.Services.AddSharedRabbitMQ(builder.Configuration);
+
+
+
+// Cách 2: Đăng ký với tùy chỉnh JsonSerializerOptions
+var customJsonOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.Create(
+        UnicodeRanges.BasicLatin,
+        UnicodeRanges.Latin1Supplement,
+        UnicodeRanges.LatinExtendedA,
+        UnicodeRanges.LatinExtendedB,
+        UnicodeRanges.LatinExtendedAdditional 
+    ),
+    WriteIndented = false,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+};
+
+builder.Services.AddSharedRabbitMQ(builder.Configuration, customJsonOptions)
+
 
 var app = builder.Build();
 ```
@@ -69,25 +92,39 @@ var app = builder.Build();
 Inject interface `IMessagePublisher` vào Controller hoặc Service của bạn. Bạn không cần lo lắng về việc mở kết nối, thư viện sẽ tự xử lý.
 
 ```bash
-public class OrdersController : ControllerBase
+public class UsersController : ControllerBase
 {
     private readonly IMessagePublisher _publisher;
 
-    public OrdersController(IMessagePublisher publisher)
+    public UsersController(IMessagePublisher publisher)
     {
         _publisher = publisher;
     }
 
-    [HttpPost]
-    public async Task<IActionResult> CreateOrder(OrderDto order)
+    [HttpPost("register")]
+    public async Task<IActionResult> Register(UserRegistrationDto user)
     {
         // Cách 1: Gửi thẳng vào Queue (Tự động tạo Queue nếu chưa có)
-        await _publisher.PublishAsync("orders-queue", order);
+        await _publisher.PublishAsync("user-registered-queue", user);
 
-        // Cách 2: Gửi vào Exchange kèm Routing Key (Cho Pub/Sub pattern)
-        await _publisher.PublishAsync("orders-exchange", ExchangeType.Topic, "order.created", order);
+        // Cách 2: Gửi vào Exchange kèm Routing Key (Pub/Sub pattern)
+        await _publisher.PublishAsync(
+            exchange: "user.events",
+            exchangeType: ExchangeType.Topic, // "direct", "fanout", "topic", "headers"
+            routingKey: "user.registered",
+            message: new
+            {
+                EventId = Guid.NewGuid(),
+                EventType = "UserRegistered",
+                EventTime = DateTime.UtcNow,
+                UserId = user.Id,
+                Email = user.Email,
+                FullName = "Phúc Đại", 
+                PhoneNumber = user.Phone,
+                RegistrationSource = "Web"
+            });
 
-        return Ok();
+        return Ok(new { Message = "User registered successfully" });
     }
 }
 ```
@@ -100,12 +137,14 @@ public class OrdersController : ControllerBase
 ```bash
 using Nexus.BuildingBlocks.Interfaces;
 
-public class OrderProcessingService : BackgroundService
+public class UserEventsConsumer : BackgroundService
 {
     private readonly IMessageConsumer _consumer;
-    private readonly ILogger<OrderProcessingService> _logger;
+    private readonly ILogger<UserEventsConsumer> _logger;
 
-    public OrderProcessingService(IMessageConsumer consumer, ILogger<OrderProcessingService> logger)
+    public UserEventsConsumer(
+        IMessageConsumer consumer,
+        ILogger<UserEventsConsumer> logger)
     {
         _consumer = consumer;
         _logger = logger;
@@ -113,23 +152,54 @@ public class OrderProcessingService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await Task.Yield(); 
+        await Task.Yield(); // Tránh block ứng dụng
 
         // 1. Đăng ký lắng nghe Queue đơn giản
-        await _consumer.Subscribe<OrderDto>("orders-queue", HandleOrderCreated);
+        await _consumer.Subscribe<UserRegisteredEvent>(
+            queueName: "user-registered-queue",
+            handler: HandleUserRegistered);
 
         // 2. Đăng ký lắng nghe Exchange phức tạp
-        await _consumer.Subscribe<OrderDto>("orders-exchange", ExchangeType.Topic, "order.created", "orders-queue", HandleOrderCreated);
+        await _consumer.Subscribe<UserRegisteredEvent>(
+            exchange: "user.events",
+            exchangeType: ExchangeType.Topic,
+            routingKey: "user.registered",
+            queueName: "auth-service-user-registered",
+            handler: HandleUserRegistered);
         
-        // Giữ service chạy ngầm mãi mãi
+        // Giữ service chạy ngầm
         await Task.Delay(Timeout.Infinite, stoppingToken);
     }
 
-    private Task HandleOrderCreated(OrderDto order)
+    private async Task HandleUserRegistered(UserRegisteredEvent userEvent)
     {
-        _logger.LogInformation($"Đang xử lý đơn hàng: {order.OrderId}");
-        return Task.CompletedTask;
+        // Tin nhắn sẽ được deserialize với Unicode đầy đủ
+        _logger.LogInformation($"Đang xử lý user: {userEvent.FullName}");
+        
+        // Xử lý business logic ở đây
+        await SendWelcomeEmailAsync(userEvent.Email, userEvent.FullName);
+        await UpdateAnalyticsAsync(userEvent.UserId);
+        
+        _logger.LogInformation($"Xử lý xong user: {userEvent.FullName}");
     }
+    
+    private async Task SendWelcomeEmailAsync(string email, string fullName)
+    {
+        // Gửi email chào mừng với tên Unicode
+        // Ví dụ: "Chào mừng Phúc Đại đến với hệ thống!"
+    }
+}
+
+// Định nghĩa DTO cho event
+public class UserRegisteredEvent
+{
+    public string EventId { get; set; } = string.Empty;
+    public string EventType { get; set; } = string.Empty;
+    public DateTime EventTime { get; set; }
+    public string UserId { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string FullName { get; set; } = string.Empty; 
+    public string RegistrationSource { get; set; } = "Web";
 }
 ```
 
@@ -151,7 +221,49 @@ ExchangeType.Headers
 ### Đừng quên đăng ký Worker trong Program.cs:
 
 ```bash
-builder.Services.AddHostedService<OrderProcessingService>();
+builder.Services.AddHostedService<UserEventsConsumer>();
+```
+
+### Tùy chỉnh Json Serialization
+
+Mặc định (Recommended):
+Thư viện đã cấu hình sẵn với Unicode support đầy đủ và an toàn:
+```bash
+// Cấu hình mặc định
+var defaultOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    Encoder = JavaScriptEncoder.Create(UnicodeRanges.All), // Hỗ trợ tất cả Unicode
+    WriteIndented = false,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+};
+```
+
+Tùy chỉnh theo nhu cầu:
+```bash
+// Tối ưu hiệu suất - chỉ hỗ trợ các Unicode ranges cần thiết
+var optimizedOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    Encoder = JavaScriptEncoder.Create(new[]
+    {
+        UnicodeRanges.BasicLatin,            // A-Z, a-z, 0-9, basic symbols
+        UnicodeRanges.Latin1Supplement,      // Latin-1: ç, ñ, ß, etc.
+        UnicodeRanges.LatinExtendedA,        // Latin extended: ā, ē, etc.
+        UnicodeRanges.LatinExtendedB,        // More Latin
+        UnicodeRanges.LatinExtendedAdditional, // Vietnamese: ắ, ằ, ẳ, etc.
+        UnicodeRanges.GeneralPunctuation,    // Punctuation
+        UnicodeRanges.CurrencySymbols,       // $, €, £, ¥, etc.
+        UnicodeRanges.NumberForms,           // ¼, ½, ¾, etc.
+        UnicodeRanges.MathematicalOperators  // +, -, ×, ÷, etc.
+    }),
+    WriteIndented = false,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+};
+
+// Đăng ký với options tùy chỉnh
+builder.Services.AddSharedRabbitMQ(builder.Configuration, optimizedOptions);
 ```
 
 ## 📝 Mẫu phản hồi API Response:

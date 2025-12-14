@@ -1,13 +1,16 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Nexus.BuildingBlocks.Configuration;
+using Nexus.BuildingBlocks.Interfaces;
 using Polly;
 using Polly.Retry;
 using RabbitMQ.Client;
-using Nexus.BuildingBlocks.Configuration;
-using Nexus.BuildingBlocks.Interfaces;
 using System.Collections.Concurrent;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Unicode;
 
 namespace Nexus.BuildingBlocks.Services
 {
@@ -22,12 +25,28 @@ namespace Nexus.BuildingBlocks.Services
         private readonly ConcurrentDictionary<string, bool> _declaredExchanges = new();
         private readonly ConcurrentDictionary<string, bool> _declaredQueues = new();
 
+        private readonly JsonSerializerOptions? _jsonOptions;
         private readonly AsyncRetryPolicy _retryPolicy;
 
-        public RabbitMQPublisher(IOptions<RabbitMQSettings> settings, ILogger<RabbitMQPublisher> logger)
+        public RabbitMQPublisher(IOptions<RabbitMQSettings> settings,
+            ILogger<RabbitMQPublisher> logger,
+            JsonSerializerOptions? jsonOptions = null)
         {
             _settings = settings.Value;
             _logger = logger;
+            _jsonOptions = jsonOptions;
+
+            if (_jsonOptions == null)
+            {
+                _jsonOptions = new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    Encoder = JavaScriptEncoder.Create(UnicodeRanges.All), 
+                    WriteIndented = false,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                    Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+                };
+            }
 
             _retryPolicy = Policy
                 .Handle<Exception>()
@@ -94,15 +113,20 @@ namespace Nexus.BuildingBlocks.Services
                     _declaredExchanges.TryAdd(exchange, true);
                 }
 
-                var json = JsonSerializer.Serialize(message);
+                var json = JsonSerializer.Serialize(message, _jsonOptions);
                 var body = Encoding.UTF8.GetBytes(json);
 
                 var properties = new BasicProperties
                 {
                     Persistent = true,
-                    ContentType = "application/json",
+                    ContentType = "application/json; charset=utf-8",
                     MessageId = Guid.NewGuid().ToString(),
-                    Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                    Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
+                    Headers = new Dictionary<string, object>
+                    {
+                        { "Message-Type", typeof(T).Name },
+                        { "Created-At", DateTime.UtcNow.ToString("o") }
+                    }
                 };
 
                 await _channel!.BasicPublishAsync(
@@ -113,7 +137,8 @@ namespace Nexus.BuildingBlocks.Services
                     body: body
                 );
 
-                _logger.LogDebug("Sent -> Ex:{Ex} RK:{RK}", exchange, routingKey);
+                _logger.LogDebug("Published message to Exchange: {Exchange}, RoutingKey: {RoutingKey}",
+                    exchange, routingKey);
             }
             catch (Exception ex)
             {
@@ -130,18 +155,28 @@ namespace Nexus.BuildingBlocks.Services
             {
                 if (!_declaredQueues.ContainsKey(queueName))
                 {
-                    await _channel!.QueueDeclareAsync(queue: queueName, durable: true, exclusive: false, autoDelete: false);
+                    await _channel!.QueueDeclareAsync(
+                        queue: queueName,
+                        durable: true,
+                        exclusive: false,
+                        autoDelete: false,
+                        arguments: null);
                     _declaredQueues.TryAdd(queueName, true);
                 }
 
-                var json = JsonSerializer.Serialize(message);
+                var json = JsonSerializer.Serialize(message, _jsonOptions);
                 var body = Encoding.UTF8.GetBytes(json);
 
                 var properties = new BasicProperties
                 {
                     Persistent = true,
-                    ContentType = "application/json",
-                    MessageId = Guid.NewGuid().ToString()
+                    ContentType = "application/json; charset=utf-8",
+                    MessageId = Guid.NewGuid().ToString(),
+                    Headers = new Dictionary<string, object>
+                    {
+                        { "Message-Type", typeof(T).Name },
+                        { "Created-At", DateTime.UtcNow.ToString("o") }
+                    }
                 };
 
                 await _channel!.BasicPublishAsync(
@@ -152,7 +187,7 @@ namespace Nexus.BuildingBlocks.Services
                     body: body
                 );
 
-                _logger.LogDebug("Sent -> Queue:{Queue}", queueName);
+                _logger.LogDebug("Published message to Queue: {Queue}", queueName);
             }
             catch (Exception ex)
             {
@@ -166,6 +201,8 @@ namespace Nexus.BuildingBlocks.Services
             if (_channel != null) await _channel.CloseAsync();
             if (_connection != null) await _connection.CloseAsync();
             _connectionLock.Dispose();
+
+            GC.SuppressFinalize(this);
         }
     }
 }

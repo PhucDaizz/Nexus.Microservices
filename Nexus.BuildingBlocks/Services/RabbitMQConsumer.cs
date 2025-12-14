@@ -1,13 +1,16 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Nexus.BuildingBlocks.Configuration;
+using Nexus.BuildingBlocks.Interfaces;
 using Polly;
 using Polly.Retry;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using Nexus.BuildingBlocks.Configuration;
-using Nexus.BuildingBlocks.Interfaces;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Unicode;
 
 namespace Nexus.BuildingBlocks.Services
 {
@@ -21,12 +24,29 @@ namespace Nexus.BuildingBlocks.Services
         private readonly SemaphoreSlim _connectionLock = new SemaphoreSlim(1, 1);
         private bool _isInitialized = false;
 
+        private readonly JsonSerializerOptions? _jsonOptions;
         private readonly AsyncRetryPolicy _retryPolicy;
 
-        public RabbitMQConsumer(IOptions<RabbitMQSettings> settings, ILogger<RabbitMQConsumer> logger)
+        public RabbitMQConsumer(
+            IOptions<RabbitMQSettings> settings,
+            ILogger<RabbitMQConsumer> logger,
+            JsonSerializerOptions? jsonOptions = null)
         {
             _settings = settings.Value;
             _logger = logger;
+            _jsonOptions = jsonOptions;
+
+            if (_jsonOptions == null)
+            {
+                _jsonOptions = new JsonSerializerOptions
+                {
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    Encoder = JavaScriptEncoder.Create(UnicodeRanges.All), 
+                    WriteIndented = false,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                    Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+                };
+            }
 
             _retryPolicy = Policy
                 .Handle<Exception>()
@@ -106,38 +126,86 @@ namespace Nexus.BuildingBlocks.Services
             var consumer = new AsyncEventingBasicConsumer(_channel!);
             consumer.ReceivedAsync += async (model, ea) =>
             {
+                string? messageJson = null;
                 try
                 {
                     var body = ea.Body.ToArray();
-                    var json = Encoding.UTF8.GetString(body);
-                    var message = JsonSerializer.Deserialize<T>(json);
+                    messageJson = Encoding.UTF8.GetString(body);
 
-                    if (message != null)
+                    _logger.LogDebug("Received message from {Queue}. DeliveryTag: {DeliveryTag}, MessageId: {MessageId}",
+                        queueName,
+                        ea.DeliveryTag,
+                        ea.BasicProperties.MessageId);
+
+                    var message = JsonSerializer.Deserialize<T>(messageJson, _jsonOptions);
+
+                    if (message == null)
                     {
-                        await handler(message);
-                        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                        _logger.LogError("Failed to deserialize message from queue {Queue}. JSON: {Json}",
+                            queueName, messageJson);
+
+                        await _channel.BasicNackAsync(
+                            ea.DeliveryTag,
+                            multiple: false,
+                            requeue: false); 
+                        return;
                     }
-                    else
-                    {
-                        await _channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
-                    }
+
+                    await handler(message);
+                    await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+
+
+                    _logger.LogDebug("Successfully processed message from {Queue}. DeliveryTag: {DeliveryTag}",
+                        queueName, ea.DeliveryTag);
+                }
+                catch (JsonException jsonEx)
+                {
+                    _logger.LogError(jsonEx,
+                        "JSON deserialization error for message in queue {Queue}. JSON: {Json}",
+                        queueName, messageJson);
+
+                    await _channel.BasicNackAsync(
+                        ea.DeliveryTag,
+                        multiple: false,
+                        requeue: false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error processing message");
-                    await _channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+                    _logger.LogError(ex,
+                        "Error processing message in queue {Queue}. DeliveryTag: {DeliveryTag}",
+                        queueName, ea.DeliveryTag);
+
+                    await _channel.BasicNackAsync(
+                        ea.DeliveryTag,
+                        multiple: false,
+                        requeue: true); 
                 }
             };
 
-            await _channel.BasicConsumeAsync(queue: queueName, autoAck: false, consumer: consumer);
+            await _channel.BasicConsumeAsync(
+                queue: queueName,
+                autoAck: false,
+                consumer: consumer);
             _logger.LogInformation($"Listening on Queue: {queueName}");
         }
 
         public async ValueTask DisposeAsync()
         {
-            if (_channel != null) await _channel.CloseAsync();
-            if (_connection != null) await _connection.CloseAsync();
+            if (_channel != null)
+            {
+                await _channel.CloseAsync();
+                await _channel.DisposeAsync();
+            }
+
+            if (_connection != null)
+            {
+                await _connection.CloseAsync();
+                await _connection.DisposeAsync();
+            }
+
             _connectionLock.Dispose();
+
+            GC.SuppressFinalize(this);
         }
     }
 }
